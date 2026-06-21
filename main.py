@@ -103,24 +103,37 @@ def parse_args():
     p_upload_folder.add_argument('--dataset-id', required=True, help='目标知识库 ID')
     p_upload_folder.add_argument('--extensions', default='.md,.txt', help='文件扩展名（逗号分隔）')
     
-    # 6. download-wechat
+    # 6. qa-ingest
+    p_qa_ingest = subparsers.add_parser('qa-ingest', help='人工精选文章 QA/标签/评分/入库')
+    p_qa_ingest.add_argument('--input', required=True, help='输入文件或目录')
+    p_qa_ingest.add_argument('--output', default='./qa-output', help='输出目录')
+    p_qa_ingest.add_argument('--report-dir', default='./qa-reports', help='报告目录')
+    p_qa_ingest.add_argument('--dataset-id', help='目标知识库 ID（可选）')
+    p_qa_ingest.add_argument('--rubric', default=None, help='评分配置 YAML 路径')
+    p_qa_ingest.add_argument('--threshold', type=int, default=None, help='准入阈值')
+    p_qa_ingest.add_argument('--extensions', default='.md,.txt', help='文件扩展名（逗号分隔）')
+    p_qa_ingest.add_argument('--dry-run', action='store_true', help='只展示将处理的文件与配置，不调用 LLM')
+    
+    # 7. download-wechat
     p_download = subparsers.add_parser('download-wechat', help='批量下载微信公众号文章')
     p_download.add_argument('--urls', required=True, help='URL 列表（直接传入 URL，多个用逗号分隔）或 URL 文件路径')
     p_download.add_argument('--output', default='./wechat-downloads', help='输出目录')
     p_download.add_argument('--formats', default='md', help='输出格式（默认 md）')
     
-    # 7. clean-wechat
+    # 8. clean-wechat
     p_clean = subparsers.add_parser('clean-wechat', help='清理微信公众号文章（两阶段）')
     p_clean.add_argument('--input', required=True, help='输入目录或文件')
     p_clean.add_argument('--output', help='输出目录（默认：输入目录_cleaned）')
     
-    # 8. download-and-clean
+    # 9. download-and-clean
     p_full = subparsers.add_parser('download-and-clean', help='下载并清理微信文章（完整流程）')
     p_full.add_argument('--urls', required=True, help='URL 列表（直接传入 URL，多个用逗号分隔）或 URL 文件路径')
     p_full.add_argument('--dataset-id', help='上传到知识库（可选）')
     p_full.add_argument('--output', default='./wechat-downloads', help='下载目录')
     p_full.add_argument('--cleaned-output', help='清理后输出目录（默认：下载目录_cleaned）')
-    
+    p_full.add_argument('--no-enrich', action='store_true',
+                        help='禁用 LLM 富化（summary/description/tags），默认开启')
+
     return parser.parse_args()
 
 
@@ -153,6 +166,81 @@ def load_urls_from_input(urls_input: str) -> List[str]:
                 urls.append(line)
     
     return urls
+
+
+
+
+def cmd_qa_ingest(args):
+    """人工精选文章 QA/标签/评分/入库"""
+    from agents.qa_agent import KnowledgeBaseQAAgent
+    from agents.qa_ingest import load_markdown_files, process_selected_articles
+
+    input_path = Path(args.input)
+    output_dir = Path(args.output)
+    report_dir = Path(args.report_dir)
+    extensions = tuple(ext.strip() for ext in args.extensions.split(',') if ext.strip())
+
+    try:
+        files = load_markdown_files(input_path, extensions=extensions)
+    except Exception as exc:
+        console.print(f"[red]❌ 读取输入失败: {exc}[/red]")
+        return
+
+    base_url = os.getenv('FASTGPT_BASE_URL')
+    api_key = os.getenv('FASTGPT_API_KEY')
+    syncer = None
+    if args.dataset_id and base_url and api_key:
+        syncer = FastGPTSyncer(base_url, api_key, args.dataset_id)
+    elif args.dataset_id:
+        console.print("[yellow]⚠️  已指定 dataset-id，但未配置 FASTGPT_BASE_URL / FASTGPT_API_KEY，跳过上传，仅生成本地结果[/yellow]")
+
+    agent = KnowledgeBaseQAAgent(threshold=args.threshold, rubric_path=args.rubric)
+
+    console.print("\n[bold cyan]🧠 一期 QA 精选文章入库[/bold cyan]")
+    console.print(f"输入: [cyan]{input_path}[/cyan]")
+    console.print(f"输出: [cyan]{output_dir}[/cyan]")
+    console.print(f"报告: [cyan]{report_dir}[/cyan]")
+    console.print(f"准入阈值: [cyan]{agent.threshold}[/cyan]")
+    console.print(f"模型: [cyan]{agent.model or '(env missing)'}[/cyan]")
+    console.print(f"Rubric: [cyan]{agent.rubric_path}[/cyan]")
+    console.print(f"匹配文件: [cyan]{len(files)}[/cyan]")
+    if syncer:
+        console.print(f"上传知识库: [cyan]{args.dataset_id}[/cyan]")
+    else:
+        console.print("上传知识库: [yellow]未配置[/yellow]")
+
+    if args.dry_run:
+        for fp in files:
+            console.print(f" - {fp}")
+        return
+
+    results = process_selected_articles(
+        input_path,
+        agent,
+        output_dir,
+        report_dir,
+        syncer=syncer,
+        extensions=extensions,
+    )
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("文件", style="cyan")
+    table.add_column("分数", style="yellow")
+    table.add_column("等级", style="green")
+    table.add_column("动作", style="white")
+    table.add_column("权重", style="magenta")
+    table.add_column("上传", style="blue")
+
+    for item in results:
+        table.add_row(
+            Path(item.source_path).name,
+            str(item.qa_score),
+            item.grade,
+            item.library_action,
+            str(item.qa_weight),
+            item.upload_result,
+        )
+    console.print(table)
 
 
 def cmd_list_datasets():
@@ -406,13 +494,14 @@ def cmd_download_wechat(args):
     """批量下载微信公众号文章"""
     console.print(f"\n[bold cyan]📥 下载微信文章[/bold cyan]")
     console.print(f"URL 输入: [cyan]{args.urls}[/cyan]")
-    console.print(f"输出目录: [cyan]{args.output}[/cyan]\n")
-    
+    console.print(f"输出根目录: [cyan]{args.output}[/cyan]\n")
+
     try:
         urls = load_urls_from_input(args.urls)
         console.print(f"[cyan]加载了 {len(urls)} 个 URL[/cyan]\n")
-        
+
         downloader = WeChatMCPDownloader(output_dir=args.output)
+        console.print(f"[dim]本次下载目录: {downloader.run_subdir}[/dim]")
         formats = tuple(args.formats.split(','))
         
         # 批量下载
@@ -526,29 +615,68 @@ def cmd_clean_wechat(args):
         logger.exception("清理微信文章时出错")
 
 
+def _find_url_for_file(url_file_map: dict, file_path: str) -> Optional[str]:
+    """在 url→files 映射中反查文件对应的真实 URL。"""
+    for url, files in url_file_map.items():
+        if file_path in files:
+            return url
+    return None
+
+
+def _extract_author_from_raw(raw: str) -> Optional[str]:
+    """从原始未清洗文本提取公众号名（JS void 链接文本）。
+
+    FormatCleaner 会提前破坏 javascript:void 链接结构，因此必须在
+    清洗前从原始内容提取，再传给 metadata。
+    """
+    import re
+    m = re.search(r'\[\s*([^\]]+?)\s*\]\(javascript:void[^)]*\)', raw)
+    if m:
+        name = m.group(1).strip()
+        if name and name not in ('作者头像',):
+            return name
+    return None
+
+
+def _parse_frontmatter_from_file(file_path) -> dict:
+    """从 Markdown 文件解析 frontmatter，返回 dict（无 frontmatter 时返回空 dict）。"""
+    try:
+        content = file_path.read_text(encoding='utf-8')
+    except Exception:
+        return {}
+    if not content.startswith('---'):
+        return {}
+    end = content.find('---', 3)
+    if end == -1:
+        return {}
+    try:
+        import yaml
+        return yaml.safe_load(content[3:end].strip()) or {}
+    except Exception:
+        return {}
+
+
 def cmd_download_and_clean(args):
     """下载并清理微信文章（完整流程）"""
     console.print(f"\n[bold cyan]🔄 下载并清理微信文章[/bold cyan]")
     console.print(f"URL 输入: [cyan]{args.urls}[/cyan]")
-    console.print(f"下载目录: [cyan]{args.output}[/cyan]")
-    
+    console.print(f"下载根目录: [cyan]{args.output}[/cyan]")
+
     cleaned_output = args.cleaned_output or f"{args.output}_cleaned"
-    console.print(f"清理输出: [cyan]{cleaned_output}[/cyan]")
-    
-    if args.dataset_id:
-        console.print(f"上传知识库: [cyan]{args.dataset_id}[/cyan]")
-    
-    console.print()
-    
+
     try:
         # 阶段 1: 下载
         console.print("[bold]阶段 1/3: 下载文章[/bold]\n")
-        
+
         urls = load_urls_from_input(args.urls)
         console.print(f"[cyan]加载了 {len(urls)} 个 URL[/cyan]\n")
-        
+
         downloader = WeChatMCPDownloader(output_dir=args.output)
-        
+
+        run_subdir = downloader.run_subdir
+        run_dir = str(downloader.output_dir)
+        console.print(f"[dim]本次下载子目录: {run_subdir}[/dim]\n")
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -557,34 +685,54 @@ def cmd_download_and_clean(args):
             console=console
         ) as progress:
             task = progress.add_task("下载文章...", total=len(urls))
-            
+
             def download_callback(current, total, result):
                 if result and result.get('status') == 'success':
                     progress.update(task, description=f"✅ {result.get('title', '完成')}")
                 progress.advance(task)
-            
+
             download_result = downloader.batch_download(urls, formats=('md',), progress_callback=download_callback)
-        
-        console.print(f"\n[green]下载完成: {download_result['success']}/{download_result['total']} 成功[/green]\n")
-        
-        # 阶段 2: 清理
+
+        console.print(f"\n[green]下载完成: {download_result['success']}/{download_result['total']} 成功[/green]")
+        console.print(f"[dim]下载目录: {download_result.get('run_dir', run_dir)}[/dim]\n")
+
+        # 阶段 2: 清理——使用白名单（仅本次下载的文件），不扫描全目录
         console.print("[bold]阶段 2/3: 清理文章[/bold]\n")
-        
-        download_dir = Path(args.output)
-        files = list(download_dir.rglob('*.md'))
-        
+
+        # 优先用 batch_download 返回的白名单文件
+        whitelist = download_result.get("files", [])
+        url_file_map = download_result.get("url_file_map", {})
+
+        if whitelist:
+            files = [Path(f) for f in whitelist if Path(f).exists()]
+            if len(files) < len(whitelist):
+                missing = [f for f in whitelist if not Path(f).exists()]
+                console.print(f"[yellow]⚠️  白名单中有 {len(missing)} 个文件不存在，已跳过[/yellow]")
+        else:
+            # 回退：扫描本次 run 子目录（不是根目录）
+            console.print("[yellow]⚠️  未获取到下载文件清单，回退扫描本次 run 目录[/yellow]")
+            files = list(Path(run_dir).rglob('*.md'))
+
         if not files:
-            console.print("[yellow]⚠️  没有下载任何文件[/yellow]")
+            console.print("[yellow]⚠️  没有可清理的文件[/yellow]")
             return
-        
-        console.print(f"[cyan]找到 {len(files)} 个文件[/cyan]\n")
-        
-        cleaned_dir = Path(cleaned_output)
+
+        # 清洗输出也进对应的 run 子目录，与下载一一对应
+        cleaned_dir = Path(cleaned_output) / run_subdir
         cleaned_dir.mkdir(parents=True, exist_ok=True)
-        
+        console.print(f"清理输出: [cyan]{cleaned_dir}[/cyan]")
+        console.print(f"[cyan]找到 {len(files)} 个文件[/cyan]\n")
+
         format_cleaner = FormatCleaner()
         frontmatter_doctor = FrontmatterDoctor()
-        
+
+        # 富化器默认开启（--no-enrich 时禁用）
+        enricher = None
+        if not args.no_enrich:
+            from agents.frontmatter_enricher import FrontmatterEnricher
+            enricher = FrontmatterEnricher()
+            console.print(f"[cyan]富化模型: {enricher.config.model or '(env missing)'}[/cyan]\n")
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -593,34 +741,48 @@ def cmd_download_and_clean(args):
             console=console
         ) as progress:
             task = progress.add_task("清理文章...", total=len(files))
-            
+
             cleaned_files = []
             for file_path in files:
                 progress.update(task, description=f"清理: {file_path.name}")
-                
+
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
+                        raw_content = f.read()
+
+                    # 预提取 author（原始文本，链接结构在清洗前保留）
+                    author = _extract_author_from_raw(raw_content)
+
                     # 阶段 1: 格式清理
-                    content, _ = format_cleaner.clean(content)
-                    
-                    # 阶段 2: Frontmatter 标准化
-                    metadata = {'original_url': file_path.name}
+                    content, _ = format_cleaner.clean(raw_content)
+
+                    # 阶段 1.5: 可选 LLM 富化（生成 summary/description/tags）
+                    metadata = {}
+                    if author:
+                        metadata['author'] = author
+                    if enricher:
+                        progress.update(task, description=f"富化: {file_path.name}")
+                        enriched = enricher.enrich(content)
+                        metadata.update({k: v for k, v in enriched.items() if v})
+
+                    # 阶段 2: Frontmatter 标准化——用真实 URL 回填 original_url
+                    original_url = _find_url_for_file(url_file_map, str(file_path))
+                    metadata['original_url'] = original_url or file_path.name
                     content, _, _ = frontmatter_doctor.standardize(content, metadata)
-                    
+
                     # 写入输出
                     output_file = cleaned_dir / file_path.name
                     with open(output_file, 'w', encoding='utf-8') as f:
                         f.write(content)
-                    
+
                     cleaned_files.append(output_file)
                 except Exception as e:
                     logger.error(f"清理 {file_path.name} 时出错: {e}")
-                
+
                 progress.advance(task)
-        
-        console.print(f"\n[green]清理完成: {len(cleaned_files)}/{len(files)} 成功[/green]\n")
+
+        console.print(f"\n[green]清理完成: {len(cleaned_files)}/{len(files)} 成功[/green]")
+        console.print(f"[dim]清洗结果: {cleaned_dir}[/dim]\n")
         
         # 阶段 3: 上传（可选）
         if args.dataset_id and cleaned_files:
@@ -647,7 +809,16 @@ def cmd_download_and_clean(args):
                     upload_skipped = 0
                     for file_path in cleaned_files:
                         progress.update(task, description=f"上传: {file_path.name}")
-                        result = syncer.upload_file(str(file_path))
+                        # 解析 frontmatter 中的 tags/summary/author 作为 FastGPT metadata
+                        fm = _parse_frontmatter_from_file(file_path)
+                        upload_meta = {
+                            "title": fm.get("title", file_path.name),
+                            "author": fm.get("author", ""),
+                            "tags": ",".join(fm.get("tags", [])),
+                            "summary": fm.get("summary", ""),
+                            "original_url": fm.get("original_url", ""),
+                        }
+                        result = syncer.upload_file(str(file_path), metadata=upload_meta)
                         if result == "success":
                             upload_success += 1
                         elif result == "skipped":
@@ -800,6 +971,7 @@ def main():
         'search': lambda: cmd_search(args),
         'upload-file': lambda: cmd_upload_file(args),
         'upload-folder': lambda: cmd_upload_folder(args),
+        'qa-ingest': lambda: cmd_qa_ingest(args),
         'download-wechat': lambda: cmd_download_wechat(args),
         'clean-wechat': lambda: cmd_clean_wechat(args),
         'download-and-clean': lambda: cmd_download_and_clean(args),

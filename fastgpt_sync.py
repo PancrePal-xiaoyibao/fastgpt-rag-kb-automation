@@ -100,12 +100,14 @@ class FastGPTSyncer:
             return False
     
     def upload_file(self, file_path: str, 
-                   collection_name: Optional[str] = None) -> str:
+                   collection_name: Optional[str] = None,
+                   metadata: Optional[dict] = None) -> str:
         """上传文件到 FastGPT（支持去重）
         
         Args:
             file_path: 文件路径
             collection_name: 集合名称（可选）
+            metadata: 可选的 QA 元数据
             
         Returns:
             "success" - 上传成功
@@ -137,6 +139,7 @@ class FastGPTSyncer:
             
             # 使用官方 create/localFile 接口
             url = f"{self.base_url}/core/dataset/collection/create/localFile"
+            metadata = metadata or {}
             
             with open(file_path, 'rb') as f:
                 files = {'file': (path.name, f)}
@@ -149,7 +152,7 @@ class FastGPTSyncer:
                     "chunkSize": 512,
                     "chunkSplitter": "",
                     "qaPrompt": "",
-                    "metadata": {}
+                    "metadata": metadata
                 }
                 
                 form_data = {
@@ -179,7 +182,8 @@ class FastGPTSyncer:
                         metadata={
                             "filename": path.name,
                             "collection_name": collection_name or path.stem,
-                            "collection_id": collection_id
+                            "collection_id": collection_id,
+                            "qa_metadata": metadata,
                         }
                     )
                     return "success"

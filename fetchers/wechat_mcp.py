@@ -20,8 +20,21 @@ class WeChatMCPDownloader:
     MCP_URL = "https://changfengbox.top/api/mcp"
     TIMEOUT = 120  # 远程服务延迟较高
     
-    def __init__(self, output_dir: str = "./wechat-downloads"):
-        self.output_dir = Path(output_dir)
+    def __init__(self, output_dir: str = "./wechat-downloads",
+                 run_subdir: Optional[str] = None):
+        """初始化下载器。
+
+        Args:
+            output_dir: 下载根目录。
+            run_subdir: 本次下载的子目录名。默认 None 时自动按时间戳生成
+                （YYYYMMDD_HHMMSS），使每次下载天然隔离，便于长期回溯。
+        """
+        base_dir = Path(output_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # 默认按时间戳隔离每次下载，避免历史残留污染本次结果
+        self.run_subdir = run_subdir or time.strftime("%Y%m%d_%H%M%S")
+        self.output_dir = base_dir / self.run_subdir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.stats = {
             'total': 0,
@@ -202,11 +215,24 @@ class WeChatMCPDownloader:
             if i < len(urls):
                 time.sleep(2)
         
+        # 聚合本次下载的文件清单和 url→file 映射，供下游清洗/评分阶段使用
+        all_files = []
+        url_file_map = {}
+        for url, result in zip(urls, results):
+            if result and result.get("status") == "success":
+                files = result.get("files", [])
+                all_files.extend(str(f) for f in files)
+                url_file_map[url] = [str(f) for f in files]
+
         return {
             "total": self.stats['total'],
             "success": self.stats['success'],
             "failed": self.stats['failed'],
-            "skipped": self.stats['skipped']
+            "skipped": self.stats['skipped'],
+            "run_dir": str(self.output_dir),
+            "run_subdir": self.run_subdir,
+            "files": all_files,
+            "url_file_map": url_file_map,
         }
     
     def _build_config(self, formats: tuple) -> dict:

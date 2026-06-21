@@ -137,7 +137,16 @@ class FrontmatterDoctor:
         author_match = re.search(r'(?:作者|author)[：:]\s*([^\n]+)', body, re.IGNORECASE)
         if author_match:
             extracted['author'] = author_match.group(1).strip()
-        
+
+        # 提取公众号名（如 `[ 药融圈 ](javascript:void...)`），优先级低于显式"作者："
+        if 'author' not in extracted:
+            mp_match = re.search(r'\[\s*([^\]]+?)\s*\]\(javascript:void[^)]*\)', body)
+            if mp_match:
+                mp_name = mp_match.group(1).strip()
+                # 过滤掉无意义的占位文本
+                if mp_name and mp_name not in ('作者头像',):
+                    extracted['author'] = mp_name
+
         return extracted
     
     def _build_standardized_frontmatter(
