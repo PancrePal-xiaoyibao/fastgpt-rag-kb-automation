@@ -198,6 +198,47 @@ class FastGPTSyncer:
             print(f"❌ 文件上传时出错: {e}")
             return "failed"
     
+    def create_dataset(
+        self,
+        name: str,
+        intro: str = "介绍",
+        avatar: str = "",
+        parent_id: Optional[str] = None,
+        vector_model: str = "text-embedding-v4",
+        agent_model: str = "step-1v-8k",
+        vlm_model: Optional[str] = None,
+    ) -> Optional[dict]:
+        """创建 FastGPT 知识库。"""
+        try:
+            vlm_model = vlm_model or os.getenv("FASTGPT_VLM_MODEL", "step-1o-turbo-vision")
+            url = f"{self.base_url}/core/dataset/create"
+            payload = {
+                "parentId": parent_id,
+                "type": "dataset",
+                "name": name,
+                "intro": intro,
+                "avatar": avatar,
+                "vectorModel": vector_model,
+                "agentModel": agent_model,
+                "vlmModel": vlm_model,
+            }
+            response = self.session.post(url, json=payload, timeout=30)
+            if response.status_code != 200:
+                print(f"❌ 创建知识库失败: {response.status_code} - {response.text}")
+                return None
+            data = response.json()
+            if data.get("code") != 200:
+                print(f"❌ 创建知识库失败: {data.get('message', '')}")
+                return None
+            print(f"✅ 创建知识库成功: {name}")
+            result = data.get("data", {})
+            if isinstance(result, str):
+                return {"_id": result}
+            return result
+        except Exception as e:
+            print(f"❌ 创建知识库时出错: {e}")
+            return None
+
     def _get_or_create_collection(self, name: str) -> Optional[str]:
         """获取或创建集合
         
