@@ -8,14 +8,17 @@
 - 文本推送（upload_text）
 """
 import json
+import logging
 import os
 import re
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict
 
-from utils.dedup import DedupManager
-from utils.hash import calculate_file_hash
+from utils.dedup import DedupManager, compute_dedup_key
+from utils.hash import calculate_file_hash, calculate_hash
+
+logger = logging.getLogger(__name__)
 
 
 class FastGPTSyncer:
@@ -119,19 +122,42 @@ class FastGPTSyncer:
             if not path.exists():
                 print(f"❌ 文件不存在: {file_path}")
                 return "failed"
-            
-            # ===== 去重检查（参考 clinicaltrails推送和订阅 的 sync_once 逻辑）=====
-            file_hash = calculate_file_hash(str(path))
-            file_identity = str(path.resolve())  # 使用绝对路径作为唯一标识
-            
-            if self.dedup.is_duplicate(file_identity, file_hash):
-                print(f"⏭️  跳过（内容未变化）: {path.name}")
-                return "skipped"
-            
+
+            metadata = metadata or {}
+
+            # ===== 去重检查（key: original_url → 内容 hash → 文件 hash）=====
+            # 读取内容用于内容 hash 与去重 key 计算
+            try:
+                content_text = path.read_text(encoding='utf-8')
+            except (UnicodeDecodeError, OSError):
+                content_text = None
+
+            dedup_key = compute_dedup_key(metadata, content_text, path)
+            # value_hash 表示"内容是否变化"，统一用内容 hash（无法读文本时回退文件字节 hash）
+            value_hash = calculate_hash(content_text) if content_text else calculate_file_hash(str(path))
+
+            existing = self.dedup.get_record(dedup_key)
+            is_update = False
+            if existing:
+                if existing.get("hash") == value_hash:
+                    print(f"⏭️  跳过（内容未变化）: {path.name}")
+                    return "skipped"
+                # 同一文档身份但内容变化 → 更新：不覆盖旧 collection，改名另存
+                is_update = True
+
+            # ===== 决定 collection 名称（更新时改名 + warn）=====
+            base_name = collection_name or path.stem
+            if is_update:
+                upload_name = f"{base_name}-{value_hash[:8]}"
+                logger.warning(
+                    "检测到内容更新，已另存为新 collection: %s（原: %s, key=%s）",
+                    upload_name, base_name, dedup_key,
+                )
+            else:
+                upload_name = base_name
+
             # 创建或获取集合
-            collection_id = self._get_or_create_collection(
-                collection_name or path.stem
-            )
+            collection_id = self._get_or_create_collection(upload_name)
             
             if not collection_id:
                 print("❌ 无法创建集合")
@@ -139,7 +165,6 @@ class FastGPTSyncer:
             
             # 使用官方 create/localFile 接口
             url = f"{self.base_url}/core/dataset/collection/create/localFile"
-            metadata = metadata or {}
             
             with open(file_path, 'rb') as f:
                 files = {'file': (path.name, f)}
@@ -177,11 +202,11 @@ class FastGPTSyncer:
                     print(f"✅ 文件上传成功: {path.name}")
                     # ===== 记录上传状态（用于下次去重）=====
                     self.dedup.update_record(
-                        file_identity, 
-                        file_hash,
+                        dedup_key,
+                        value_hash,
                         metadata={
                             "filename": path.name,
-                            "collection_name": collection_name or path.stem,
+                            "collection_name": upload_name,
                             "collection_id": collection_id,
                             "qa_metadata": metadata,
                         }

@@ -156,3 +156,68 @@ def test_create_dataset_falls_back_to_env_vlm_model(monkeypatch, tmp_path):
 
     assert result == {"_id": "dataset-001"}
     assert captured["json"]["vlmModel"] == "step-1o-turbo-vision"
+
+
+# ---------------------------------------------------------------------------
+# upload_file 去重行为（spec §5 / §6）
+# ---------------------------------------------------------------------------
+
+def test_upload_file_skips_unchanged_content(monkeypatch, tmp_path):
+    syncer = _make_syncer(tmp_path)
+    monkeypatch.setattr(syncer, "_get_or_create_collection", lambda name: "cid")
+    monkeypatch.setattr(
+        "fastgpt_sync.requests.post",
+        lambda *a, **k: _FakeResponse(200, {"code": 200}),
+    )
+    f = tmp_path / "art.md"
+    f.write_text("正文\n", encoding="utf-8")
+    meta = {"original_url": "https://e.com/1"}
+
+    assert syncer.upload_file(str(f), metadata=meta) == "success"
+    # 同 url、同内容 → 跳过
+    assert syncer.upload_file(str(f), metadata=meta) == "skipped"
+
+
+def test_upload_file_update_renames_collection_and_warns(monkeypatch, tmp_path, caplog):
+    syncer = _make_syncer(tmp_path)
+    names = []
+    monkeypatch.setattr(
+        syncer, "_get_or_create_collection",
+        lambda name: (names.append(name), "cid")[1],
+    )
+    monkeypatch.setattr(
+        "fastgpt_sync.requests.post",
+        lambda *a, **k: _FakeResponse(200, {"code": 200}),
+    )
+    f = tmp_path / "art.md"
+    meta = {"original_url": "https://e.com/1"}
+
+    f.write_text("正文 v1\n", encoding="utf-8")
+    assert syncer.upload_file(str(f), collection_name="doc", metadata=meta) == "success"
+
+    # 同 url、内容变化 → 视为更新：改名上传 + warn，不覆盖旧 collection
+    f.write_text("正文 v2 已更新\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert syncer.upload_file(str(f), collection_name="doc", metadata=meta) == "success"
+
+    assert names[0] == "doc"
+    assert names[1].startswith("doc-") and names[1] != "doc"
+    assert any("内容更新" in r.message for r in caplog.records)
+
+
+def test_upload_file_dedup_by_url_across_paths(monkeypatch, tmp_path):
+    syncer = _make_syncer(tmp_path)
+    monkeypatch.setattr(syncer, "_get_or_create_collection", lambda name: "cid")
+    monkeypatch.setattr(
+        "fastgpt_sync.requests.post",
+        lambda *a, **k: _FakeResponse(200, {"code": 200}),
+    )
+    f1 = tmp_path / "a.md"
+    f2 = tmp_path / "b.md"
+    f1.write_text("同样的正文\n", encoding="utf-8")
+    f2.write_text("同样的正文\n", encoding="utf-8")
+    meta = {"original_url": "https://e.com/x"}
+
+    assert syncer.upload_file(str(f1), metadata=meta) == "success"
+    # 不同路径，但相同 url + 内容 → 跳过（旧实现按绝对路径会重传）
+    assert syncer.upload_file(str(f2), metadata=meta) == "skipped"
