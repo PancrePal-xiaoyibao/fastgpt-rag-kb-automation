@@ -8,9 +8,10 @@ FastGPT 内容处理器 - 主程序
 3. search: 在知识库中搜索内容
 4. upload-file: 上传单个文件到知识库
 5. upload-folder: 上传整个文件夹到知识库
-6. download-wechat: 批量下载微信公众号文章
-7. clean-wechat: 清理微信公众号文章（两阶段）
-8. download-and-clean: 下载并清理微信文章（完整流程）
+6. create-dataset: 创建知识库
+7. download-wechat: 批量下载微信公众号文章
+8. clean-wechat: 清理微信公众号文章（两阶段）
+9. download-and-clean: 下载并清理微信文章（完整流程）
 
 使用示例：
     python main.py list-datasets
@@ -55,6 +56,17 @@ from fetchers.wechat_mcp import WeChatMCPDownloader
 from cleaners import FormatCleaner, FrontmatterDoctor
 
 
+def _make_fastgpt_syncer(dataset_id: Optional[str] = None) -> Optional[FastGPTSyncer]:
+    """统一创建 FastGPT 同步器，避免各命令重复读取环境变量。"""
+    base_url = os.getenv('FASTGPT_BASE_URL')
+    api_key = os.getenv('FASTGPT_API_KEY')
+
+    if not base_url or not api_key:
+        return None
+
+    return FastGPTSyncer(base_url, api_key, dataset_id)
+
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -68,6 +80,7 @@ def parse_args():
   %(prog)s search --query "关键词" --dataset-id abc     搜索知识库
   %(prog)s upload-file --file article.md                上传单个文件
   %(prog)s upload-folder --folder ./articles            上传文件夹
+  %(prog)s create-dataset --name "测试"                 创建知识库
   %(prog)s download-wechat --urls urls.txt              下载微信文章（从文件）
   %(prog)s download-wechat --urls https://mp.weixin...  下载微信文章（直接传入 URL）
   %(prog)s download-wechat --urls url1,url2             下载多个微信文章（逗号分隔）
@@ -102,8 +115,18 @@ def parse_args():
     p_upload_folder.add_argument('--folder', required=True, help='文件夹路径')
     p_upload_folder.add_argument('--dataset-id', required=True, help='目标知识库 ID')
     p_upload_folder.add_argument('--extensions', default='.md,.txt', help='文件扩展名（逗号分隔）')
-    
-    # 6. qa-ingest
+
+    # 6. create-dataset
+    p_create_dataset = subparsers.add_parser('create-dataset', help='创建知识库')
+    p_create_dataset.add_argument('--name', required=True, help='知识库名称')
+    p_create_dataset.add_argument('--intro', default='介绍', help='知识库介绍')
+    p_create_dataset.add_argument('--avatar', default='', help='知识库头像/图标')
+    p_create_dataset.add_argument('--parent-id', default=None, help='父级知识库 ID（可选）')
+    p_create_dataset.add_argument('--vector-model', default='text-embedding-v4', help='向量模型（默认 text-embedding-v4）')
+    p_create_dataset.add_argument('--agent-model', default='step-1v-8k', help='Agent 模型（默认 step-1v-8k）')
+    p_create_dataset.add_argument('--vlm-model', default=None, help='VLM 模型（默认读取 FASTGPT_VLM_MODEL）')
+
+    # 7. qa-ingest
     p_qa_ingest = subparsers.add_parser('qa-ingest', help='人工精选文章 QA/标签/评分/入库')
     p_qa_ingest.add_argument('--input', required=True, help='输入文件或目录')
     p_qa_ingest.add_argument('--output', default='./qa-output', help='输出目录')
@@ -114,18 +137,18 @@ def parse_args():
     p_qa_ingest.add_argument('--extensions', default='.md,.txt', help='文件扩展名（逗号分隔）')
     p_qa_ingest.add_argument('--dry-run', action='store_true', help='只展示将处理的文件与配置，不调用 LLM')
     
-    # 7. download-wechat
+    # 8. download-wechat
     p_download = subparsers.add_parser('download-wechat', help='批量下载微信公众号文章')
     p_download.add_argument('--urls', required=True, help='URL 列表（直接传入 URL，多个用逗号分隔）或 URL 文件路径')
     p_download.add_argument('--output', default='./wechat-downloads', help='输出目录')
     p_download.add_argument('--formats', default='md', help='输出格式（默认 md）')
     
-    # 8. clean-wechat
+    # 9. clean-wechat
     p_clean = subparsers.add_parser('clean-wechat', help='清理微信公众号文章（两阶段）')
     p_clean.add_argument('--input', required=True, help='输入目录或文件')
     p_clean.add_argument('--output', help='输出目录（默认：输入目录_cleaned）')
     
-    # 9. download-and-clean
+    # 10. download-and-clean
     p_full = subparsers.add_parser('download-and-clean', help='下载并清理微信文章（完整流程）')
     p_full.add_argument('--urls', required=True, help='URL 列表（直接传入 URL，多个用逗号分隔）或 URL 文件路径')
     p_full.add_argument('--dataset-id', help='上传到知识库（可选）')
@@ -490,6 +513,48 @@ def cmd_upload_folder(args):
         logger.exception("上传文件夹时出错")
 
 
+def cmd_create_dataset(args):
+    """创建 FastGPT 知识库"""
+    console.print(f"\n[bold cyan]🆕 创建知识库[/bold cyan]")
+    console.print(f"名称: [cyan]{args.name}[/cyan]")
+    console.print(f"介绍: [cyan]{args.intro}[/cyan]")
+    console.print(f"父级 ID: [cyan]{args.parent_id or '(root)'}[/cyan]")
+    console.print(
+        f"[dim]模型: vector={args.vector_model}, agent={args.agent_model}, "
+        f"vlm={args.vlm_model or 'step-1o-turbo-vision'}[/dim]\n"
+    )
+
+    syncer = _make_fastgpt_syncer()
+    if not syncer:
+        console.print("[red]❌ 错误: 未配置 FASTGPT_BASE_URL 或 FASTGPT_API_KEY[/red]")
+        return
+
+    try:
+        result = syncer.create_dataset(
+            name=args.name,
+            intro=args.intro,
+            avatar=args.avatar,
+            parent_id=args.parent_id,
+            vector_model=args.vector_model,
+            agent_model=args.agent_model,
+            vlm_model=args.vlm_model,
+        )
+
+        if not result:
+            console.print("\n[red]❌ 创建失败[/red]\n")
+            return
+
+        dataset_id = result if isinstance(result, str) else (
+            result.get('_id') or result.get('id') or result.get('datasetId')
+        )
+        console.print("\n[green]✅ 创建成功[/green]")
+        if dataset_id:
+            console.print(f"[cyan]知识库 ID: {dataset_id}[/cyan]\n")
+    except Exception as e:
+        console.print(f"[red]❌ 错误: {e}[/red]")
+        logger.exception("创建知识库时出错")
+
+
 def cmd_download_wechat(args):
     """批量下载微信公众号文章"""
     console.print(f"\n[bold cyan]📥 下载微信文章[/bold cyan]")
@@ -844,14 +909,15 @@ def interactive_menu():
     console.print("  3. 搜索知识库内容")
     console.print("  4. 上传单个文件")
     console.print("  5. 上传整个文件夹")
-    console.print("  6. 下载微信文章（支持单个或多个 URL）")
-    console.print("  7. 清理已下载的微信文章")
-    console.print("  8. 下载并清理微信文章（完整流程）")
+    console.print("  6. 创建知识库")
+    console.print("  7. 下载微信文章（支持单个或多个 URL）")
+    console.print("  8. 清理已下载的微信文章")
+    console.print("  9. 下载并清理微信文章（完整流程）")
     console.print("  0. 退出\n")
     
     while True:
         try:
-            choice = console.input("[bold green]请选择功能 (0-8): [/bold green]").strip()
+            choice = console.input("[bold green]请选择功能 (0-9): [/bold green]").strip()
             
             if choice == '0':
                 console.print("[yellow]👋 再见！[/yellow]\n")
@@ -904,6 +970,26 @@ def interactive_menu():
                 
                 cmd_upload_folder(Args(folder_path, dataset_id, extensions))
             elif choice == '6':
+                name = console.input("[cyan]请输入知识库名称: [/cyan]").strip()
+                intro = console.input("[cyan]请输入知识库介绍 (默认 介绍): [/cyan]").strip() or "介绍"
+                avatar = console.input("[cyan]请输入头像/图标 (可留空): [/cyan]").strip()
+                parent_id = console.input("[cyan]请输入父级 ID (可留空): [/cyan]").strip() or None
+                vector_model = console.input("[cyan]向量模型 (默认 text-embedding-v4): [/cyan]").strip() or "text-embedding-v4"
+                agent_model = console.input("[cyan]Agent 模型 (默认 step-1v-8k): [/cyan]").strip() or "step-1v-8k"
+                vlm_model = console.input("[cyan]VLM 模型 (回车使用 step-1o-turbo-vision): [/cyan]").strip() or None
+
+                class Args:
+                    def __init__(self, name, intro, avatar, parent_id, vector_model, agent_model, vlm_model):
+                        self.name = name
+                        self.intro = intro
+                        self.avatar = avatar
+                        self.parent_id = parent_id
+                        self.vector_model = vector_model
+                        self.agent_model = agent_model
+                        self.vlm_model = vlm_model
+
+                cmd_create_dataset(Args(name, intro, avatar, parent_id, vector_model, agent_model, vlm_model))
+            elif choice == '7':
                 urls = console.input("[cyan]请输入 URL（多个用逗号分隔）或 URL 文件路径: [/cyan]").strip()
                 output = console.input("[cyan]输出目录 (默认 ./wechat-downloads): [/cyan]").strip() or "./wechat-downloads"
                 formats = console.input("[cyan]输出格式 (默认 md): [/cyan]").strip() or "md"
@@ -915,7 +1001,7 @@ def interactive_menu():
                         self.formats = formats
                 
                 cmd_download_wechat(Args(urls, output, formats))
-            elif choice == '7':
+            elif choice == '8':
                 input_path = console.input("[cyan]请输入输入目录或文件路径: [/cyan]").strip()
                 output = console.input("[cyan]输出目录 (留空使用默认): [/cyan]").strip() or None
                 
@@ -925,7 +1011,7 @@ def interactive_menu():
                         self.output = output
                 
                 cmd_clean_wechat(Args(input_path, output))
-            elif choice == '8':
+            elif choice == '9':
                 urls = console.input("[cyan]请输入 URL（多个用逗号分隔）或 URL 文件路径: [/cyan]").strip()
                 output = console.input("[cyan]下载目录 (默认 ./wechat-downloads): [/cyan]").strip() or "./wechat-downloads"
                 cleaned_output = console.input("[cyan]清理后输出目录 (留空使用默认): [/cyan]").strip() or None
@@ -943,7 +1029,7 @@ def interactive_menu():
                 console.print("[red]❌ 无效选择，请重新输入[/red]\n")
             
             # 执行完成后等待用户确认
-            if choice in ['1', '2', '3', '4', '5', '6', '7', '8']:
+            if choice in ['1', '2', '3', '4', '5', '6', '7', '8', '9']:
                 console.input("\n[dim]按 Enter 继续...[/dim]")
                 console.print("\n" + "="*60 + "\n")
         

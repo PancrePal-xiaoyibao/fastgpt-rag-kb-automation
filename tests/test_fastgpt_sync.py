@@ -132,3 +132,27 @@ def test_create_dataset_overrides_vlm_model_argument(monkeypatch, tmp_path):
 
     assert result == {"_id": "dataset-001"}
     assert captured["json"]["vlmModel"] == "custom-vlm"
+
+
+def test_create_dataset_falls_back_to_env_vlm_model(monkeypatch, tmp_path):
+    syncer = _make_syncer(tmp_path)
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {"code": 200, "data": {"_id": "dataset-001"}}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setenv("FASTGPT_VLM_MODEL", "step-1o-turbo-vision")
+    monkeypatch.setattr(syncer.session, "post", fake_post)
+
+    result = syncer.create_dataset("测试", vlm_model=None)
+
+    assert result == {"_id": "dataset-001"}
+    assert captured["json"]["vlmModel"] == "step-1o-turbo-vision"
