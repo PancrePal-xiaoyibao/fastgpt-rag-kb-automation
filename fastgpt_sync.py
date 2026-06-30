@@ -14,6 +14,7 @@ import re
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict
+from urllib.parse import quote
 
 from utils.dedup import DedupManager, compute_dedup_key
 from utils.hash import calculate_file_hash, calculate_hash
@@ -104,14 +105,20 @@ class FastGPTSyncer:
     
     def upload_file(self, file_path: str, 
                    collection_name: Optional[str] = None,
-                   metadata: Optional[dict] = None) -> str:
+                   metadata: Optional[dict] = None,
+                   parent_id: Optional[str] = None) -> str:
         """上传文件到 FastGPT（支持去重）
-        
+
+        采用官方 create/localFile 接口：该接口会**自动创建集合并触发训练/embedding**，
+        因此 parentId 默认传 None（与官方 curl 一致），不再预建一个空集合当父级
+        （预建 file 类型集合当 parentId 会导致训练不触发）。集合名由上传的文件名决定。
+
         Args:
             file_path: 文件路径
-            collection_name: 集合名称（可选）
+            collection_name: 集合名称（可选；默认用文件名，仅用于覆盖集合显示名）
             metadata: 可选的 QA 元数据
-            
+            parent_id: 可选的父级**文件夹**集合 ID（用于目录归类，默认 None=根）
+
         Returns:
             "success" - 上传成功
             "skipped" - 文件已上传且内容未变化（跳过）
@@ -145,49 +152,45 @@ class FastGPTSyncer:
                 # 同一文档身份但内容变化 → 更新：不覆盖旧 collection，改名另存
                 is_update = True
 
-            # ===== 决定 collection 名称（更新时改名 + warn）=====
+            # ===== 决定上传文件名（localFile 接口以文件名作为集合名）=====
             base_name = collection_name or path.stem
             if is_update:
-                upload_name = f"{base_name}-{value_hash[:8]}"
+                base_name = f"{base_name}-{value_hash[:8]}"
                 logger.warning(
-                    "检测到内容更新，已另存为新 collection: %s（原: %s, key=%s）",
-                    upload_name, base_name, dedup_key,
+                    "检测到内容更新，已另存为新集合: %s（原: %s, key=%s）",
+                    base_name, collection_name or path.stem, dedup_key,
                 )
-            else:
-                upload_name = base_name
+            upload_filename = f"{base_name}{path.suffix}"
 
-            # 创建或获取集合
-            collection_id = self._get_or_create_collection(upload_name)
-            
-            if not collection_id:
-                print("❌ 无法创建集合")
-                return "failed"
-            
-            # 使用官方 create/localFile 接口
+            # 中文文件名需 encode：multipart 的 Content-Disposition 在部分服务端会按
+            # latin-1 解析导致乱码；这里做 RFC3986 百分号编码，FastGPT 端会 decode 还原。
+            safe_filename = quote(upload_filename)
+
+            # 使用官方 create/localFile 接口（自动建集合 + 触发训练/embedding）
             url = f"{self.base_url}/core/dataset/collection/create/localFile"
-            
+
             with open(file_path, 'rb') as f:
-                files = {'file': (path.name, f)}
-                
-                # 严格按照官方参数格式
+                files = {'file': (safe_filename, f)}
+
+                # 严格按照官方参数格式（parentId 默认 None，与官方 curl 一致）
                 data_payload = {
                     "datasetId": self.dataset_id,
-                    "parentId": collection_id,
+                    "parentId": parent_id,
                     "trainingType": "chunk",
                     "chunkSize": 512,
                     "chunkSplitter": "",
                     "qaPrompt": "",
                     "metadata": metadata
                 }
-                
+
                 form_data = {
                     "data": json.dumps(data_payload)
                 }
-                
-                # 临时移除 Content-Type 让 requests 自动设置
+
+                # 临时移除 Content-Type 让 requests 自动设置 multipart 边界
                 headers = self.session.headers.copy()
                 headers.pop('Content-Type', None)
-                
+
                 response = requests.post(
                     url, 
                     headers=headers,
@@ -206,8 +209,7 @@ class FastGPTSyncer:
                         value_hash,
                         metadata={
                             "filename": path.name,
-                            "collection_name": upload_name,
-                            "collection_id": collection_id,
+                            "collection_name": upload_filename,
                             "qa_metadata": metadata,
                         }
                     )

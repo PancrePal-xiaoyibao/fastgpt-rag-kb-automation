@@ -6,6 +6,7 @@
 
 import json
 from unittest.mock import MagicMock
+from urllib.parse import quote
 
 from fastgpt_sync import FastGPTSyncer
 
@@ -55,7 +56,7 @@ def test_upload_file_sends_qa_metadata(monkeypatch, tmp_path):
 
     assert result == "success"
     assert captured["data"]["datasetId"] == "dataset-123"
-    assert captured["data"]["parentId"] == "collection-id"
+    assert captured["data"]["parentId"] is None
     assert captured["data"]["metadata"] == {"qa_score": 90, "qa_weight": 1.0, "qa_grade": "A"}
     assert captured["url"].endswith("/core/dataset/collection/create/localFile")
 
@@ -180,29 +181,49 @@ def test_upload_file_skips_unchanged_content(monkeypatch, tmp_path):
 
 def test_upload_file_update_renames_collection_and_warns(monkeypatch, tmp_path, caplog):
     syncer = _make_syncer(tmp_path)
-    names = []
-    monkeypatch.setattr(
-        syncer, "_get_or_create_collection",
-        lambda name: (names.append(name), "cid")[1],
-    )
-    monkeypatch.setattr(
-        "fastgpt_sync.requests.post",
-        lambda *a, **k: _FakeResponse(200, {"code": 200}),
-    )
+    captured_names = []
+
+    def fake_post(url, headers=None, files=None, data=None, timeout=None):
+        # files['file'] = (filename, fileobj)；localFile 以文件名作为集合名
+        captured_names.append(files['file'][0])
+        return _FakeResponse(200, {"code": 200})
+
+    monkeypatch.setattr("fastgpt_sync.requests.post", fake_post)
     f = tmp_path / "art.md"
     meta = {"original_url": "https://e.com/1"}
 
     f.write_text("正文 v1\n", encoding="utf-8")
     assert syncer.upload_file(str(f), collection_name="doc", metadata=meta) == "success"
 
-    # 同 url、内容变化 → 视为更新：改名上传 + warn，不覆盖旧 collection
+    # 同 url、内容变化 → 视为更新：改名上传 + warn，不覆盖旧集合
     f.write_text("正文 v2 已更新\n", encoding="utf-8")
     with caplog.at_level("WARNING"):
         assert syncer.upload_file(str(f), collection_name="doc", metadata=meta) == "success"
 
-    assert names[0] == "doc"
-    assert names[1].startswith("doc-") and names[1] != "doc"
+    assert captured_names[0] == "doc.md"
+    assert captured_names[1].startswith("doc-") and captured_names[1].endswith(".md")
+    assert captured_names[1] != "doc.md"
     assert any("内容更新" in r.message for r in caplog.records)
+
+
+def test_upload_file_encodes_chinese_filename(monkeypatch, tmp_path):
+    """中文文件名应被 encode（避免 multipart 乱码）。"""
+    syncer = _make_syncer(tmp_path)
+    captured = {}
+
+    def fake_post(url, headers=None, files=None, data=None, timeout=None):
+        captured["filename"] = files['file'][0]
+        return _FakeResponse(200, {"code": 200})
+
+    monkeypatch.setattr("fastgpt_sync.requests.post", fake_post)
+    f = tmp_path / "中文文章.md"
+    f.write_text("正文\n", encoding="utf-8")
+
+    assert syncer.upload_file(str(f)) == "success"
+    # 发送的文件名应为百分号编码（纯 ASCII），且可还原为原名
+    assert captured["filename"] == quote("中文文章.md")
+    from urllib.parse import unquote
+    assert unquote(captured["filename"]) == "中文文章.md"
 
 
 def test_upload_file_dedup_by_url_across_paths(monkeypatch, tmp_path):
